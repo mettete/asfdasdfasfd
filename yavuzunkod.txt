@@ -1,0 +1,180 @@
+const keep_alive = require('./keep_alive.js')
+const starknet = require("starknet");
+const { Account, Provider, ec, Contract } = starknet;
+const BN = require('bn.js');
+const avnu = require("@avnu/avnu-sdk");
+const TelegramBot = require('node-telegram-bot-api');
+const axios = require('axios');
+
+require("dotenv").config();
+
+const provider = new Provider({ sequencer: { network: 'mainnet-alpha' } });
+const privateKey = process.env.PRIVATE_KEY;
+const starkKeyPair = ec.getKeyPair(privateKey);
+const accountAddress = "0x040d592396f9f5e0003f90744137ba40cbecff7a157f33674574012ab2de1ef1";
+const account = new Account(provider, accountAddress, starkKeyPair);
+const apiKey = 'B7M1JCZ8ARFJESQJJZC5UF4ZMX6BHFW8AT';
+const bot = new TelegramBot('6218710822:AAE8YdLluxqKnKdvtp5shf2HE8kk1pfmTms', { polling: true });
+
+// Make sure to use the correct contract addresses
+const addrMap = {
+  "ETH": '0x049d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7',
+  "DAI": '0x00da114221cb83fa859dbdb4c44beeaa0bb37c7537ad5ae66fe5e0efd20e6eb3',
+  "USDT": '0x068f5c6a61780768455de69077e07e89787839bf8166decfbf92b645209c0fb8',
+  "USDC": '0x053c91253bc9682c04929ca02ed00b3e423f6710d2ee7e0d5ebb06f3ecf368a8',
+  "WBTC": '0x03fe2b97c1fd336e750087d68b9b867997fd64a2661ff3ca5a7c771641e8e7ac'
+}
+
+const limits = {
+  "ETH": { "minimumLast": 0.01 * 1e18, "maxSellRatio": 40 },
+  "DAI": { "minimumLast": 0 * 1e18, "maxSellRatio": 100 },
+  "USDT": { "minimumLast": 0 * 1e6, "maxSellRatio": 100 },
+  "USDC": { "minimumLast": 0 * 1e6, "maxSellRatio": 100 },
+  "WBTC": { "minimumLast": 0 * 1e6, "maxSellRatio": 100 }
+}
+const tokens = Object.keys(addrMap);
+let arbitrageCount = 0;
+let totalProfit = 0;
+let totalGasCost = 0;
+
+const avnuOptions = {
+  baseUrl: 'https://starknet.api.avnu.fi', // AVNU API base URL Add other options if necessary
+};
+let erc20Map = {};
+let ethErc20Abi = {};
+let daiErc20Abi = {};
+let currentGasPrice = null; // Global variable for gas price
+
+async function getGasPrice() {
+  try {
+    const response = await axios.get(`https://api.etherscan.io/api?module=gastracker&action=gasoracle&apikey=${apiKey}`);
+    if (response.data && response.data.result && response.data.result.ProposeGasPrice) {
+      currentGasPrice = response.data.result.ProposeGasPrice;
+      return currentGasPrice;
+    } else {
+      console.error('Gas ücretini alırken bir hata oluştu');
+      return null;
+    }
+  } catch (error) {
+    console.error('Gas ücretini alırken bir hata oluştu:', error);
+    return null;
+  }
+}
+
+async function searchArbitrageOpportunities() {
+  console.log(`Current gas price: ${currentGasPrice}`); // Gas price is displayed here
+  console.log("-------------------------");
+  ethErc20Abi = (await provider.getClassAt('0x048624e084dc68d82076582219c7ed8cb0910c01746cca3cd72a28ecfe07e42d')).abi;
+  daiErc20Abi = (await provider.getClassAt('0x00dA114221cb83fa859DBdb4C44bEeaa0BB37C7537ad5ae66Fe5e0efD20E6eB3')).abi;
+  console.log(tokens);
+  for (let tokenToSell of tokens) {
+    for (let tokenToBuy of tokens) {
+      if (tokenToSell == tokenToBuy) continue;
+      try {
+        console.log("\n\n\n" + tokenToSell + " Satılacak, " + tokenToBuy + " Alınacak.")
+        let sellAmount;
+        const combination = tokenToSell + "-" + tokenToBuy;
+        if (erc20Map[combination] == undefined) {
+          erc20Map[combination] = new Contract(tokenToSell == "DAI" ? daiErc20Abi : ethErc20Abi, addrMap[tokenToSell], provider);
+          erc20Map[combination].connect(account);
+        }
+
+        const balance = await erc20Map[combination].balanceOf(accountAddress);
+        if (balance[0] && balance[0].low) {
+          console.log("MEVCUT " + tokenToSell + ": " + balance[0].low);
+          sellAmount = BigInt(balance[0].low.toString()) * BigInt(limits[tokenToSell]["maxSellRatio"]) / BigInt(100); // 90% of the balance
+          let sellAmountWei = new BN(sellAmount.toString());
+          sellAmount = "0x" + sellAmountWei.toString("hex");
+        } else {
+          console.log("İŞLEM GERÇEKLEŞMEDİ SELL 0"); continue;
+        }
+
+        console.log("Sell amount:", parseInt(sellAmount));
+        const balanceAfterSell = (parseInt(BigInt(balance[0].low.toString())) - parseInt(sellAmount));
+        //Eğer satılacak tokenda satıştan sonra kalacak olan miktar, limittekine eşit veya düşükse işlemi yapma
+        console.log(balanceAfterSell);
+        if (balanceAfterSell < limits[tokenToSell]["minimumLast"]) {
+          console.log("İŞLEM GERÇEKLEŞMEDİ LİMİT"); continue;
+        }
+
+        // Define the quote request
+        const quoteRequest = {
+          sellTokenAddress: addrMap[tokenToSell],
+          buyTokenAddress: addrMap[tokenToBuy],
+          sellAmount: sellAmount,
+        };
+
+        // Fetch quotes from AVNU API
+        const quotes = await avnu.fetchQuotes(quoteRequest, avnuOptions);
+        if (quotes?.length > 0) {
+          // Sort quotes by profit
+          quotes.sort((a, b) => (BigInt(b.buyAmountInUsd) - BigInt(b.sellAmountInUsd)) - (BigInt(a.buyAmountInUsd) - BigInt(a.sellAmountInUsd)));
+
+          const bestQuote = quotes[0];
+          console.log("Best quote:", bestQuote.sellTokenAddress, "----> ", bestQuote.buyTokenAddress);
+          let gasCostInUsd;
+
+          if (currentGasPrice <= 15) {
+            gasCostInUsd = 3;
+          } else if (currentGasPrice >= 15 && currentGasPrice <= 20) {
+            gasCostInUsd = 4;
+          } else if (currentGasPrice >= 20 && currentGasPrice <= 30) {
+            gasCostInUsd = 5;
+          } else if (currentGasPrice >= 30 && currentGasPrice <= 40) {
+            gasCostInUsd = 7;
+          } else if (currentGasPrice >= 40 && currentGasPrice <= 50) {
+            gasCostInUsd = 9;
+          } else {
+            gasCostInUsd = 999;
+          }
+          console.log(`Current gas cost in USD: ${gasCostInUsd}`);
+
+          // Check if the profit is greater than the potential slippage loss and gas cost
+          const profitInUsd = bestQuote.buyAmountInUsd - bestQuote.sellAmountInUsd - gasCostInUsd;
+          console.log("\nprofit", profitInUsd, bestQuote.buyAmountInUsd, " --- ", bestQuote.sellAmountInUsd);
+
+          //console.log(`\nMiktarlar: ${bestQuote.buyAmount} tane ${tokenToBuy} alınacak, ${bestQuote.sellAmount} tane ${tokenToSell} satılacak.`);
+
+          if (profitInUsd <= 0) {
+            console.log("Profit < 0 olduğu için işlem iptal");
+            continue;
+          }
+          // Execute swap
+          const swapResult = await avnu.executeSwap(account, bestQuote, { executeApprove: true, gasless: false, nonce: 'your_nonce', slippage: 0.015 }, avnuOptions);
+          // rest of your code
+        } else {
+          console.log("Slippage çok fazla işlemi iptal et.");
+        }
+        console.log("Swap result:", swapResult);
+        totalGasCost += gasCostInUsd;
+        console.log("GAZ (USD):", gasCostInUsd);
+        totalProfit += profitInUsd;
+        console.log("KAR (USD):", profitInUsd);
+        arbitrageCount++;
+
+        console.log("Karlı bir işlem başlatıldı, 10 dakika bekleniyor...");
+        bot.sendMessage('1073946048', `Toplam kar: ${totalProfit}, Gas: ${currentGasPrice}, https://starkscan.co/tx/${swapResult.transactionHash}`);
+        await new Promise(resolve => setTimeout(resolve, 600000)); // 10 minutes
+      } catch (error) {
+        console.log("ERROR:", error);
+      }
+    }
+  }
+
+  console.log("-------------------------");
+  console.log("BAŞARILI ARBİTRAJ SAYISI: ", arbitrageCount);
+  console.log("ToPLAM KAR (USD): ", totalProfit);
+  console.log("TOPLAM GAZ (USD): ", totalGasCost);
+  //bot.sendMessage('1073946048', `sa`);
+  await getGasPrice();
+  // Call the function again after 30 seconds
+  await setTimeout(searchArbitrageOpportunities, 30000);
+  console.log("-------------------------");
+}
+
+// Start the function for the first time
+async function start() {
+  await getGasPrice();
+  searchArbitrageOpportunities();
+}
+start();
